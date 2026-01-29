@@ -7,6 +7,7 @@
 #include <utility>
 #include <sys/wait.h>
 #include <vector>
+#include <err.h>
 
 namespace {
     
