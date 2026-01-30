@@ -58,6 +58,14 @@ namespace event_data {
         EVT_ERROR         = 5  // Something went wrong
     };
 
+    struct PolicyWorker {
+        int id;             // Indeks w wektorze
+        pid_t pid;          // PID procesu
+        int pipe_in;        // Do pisania (Input Polityki)
+        int pipe_out;       // Do czytania (Output Polityki)
+        bool is_busy;       // Czy aktualnie mieli jakiś test?
+    };
+
     // The message packet sent through the pipe
     struct Event {
         EventType type;
@@ -83,8 +91,8 @@ namespace event_data {
         
         // Process IDs (Needed for SIGINT cleanup)
         pid_t env_pid = -1;
-        pid_t policy_pid = -1;
         pid_t current_worker_pid = -1;
+        int assigned_worker_idx = -1;
 
         // Pipe File Descriptors (Parent's end)
         int env_in = -1;  // We write Actions here
@@ -97,6 +105,8 @@ namespace event_data {
         
         // Temporary storage for the byte caught by the Waiter
         char latch_byte = 0; 
+        std::string answer;
+        bool is_calculated = false;
     };
 }
 
