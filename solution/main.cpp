@@ -14,22 +14,17 @@
 #include <stdexcept>
 
 #include "defs.h"
-#include "err.h"
+#include "error.h"
 
 using namespace std;
 using namespace event_data;
 
 
-std::atomic<bool> stop_requested(false);
+atomic<bool> stop_requested(false);
+atomic<bool> shut_soft(false);
 
 void handle_sigint(int) {
     stop_requested = true;
-}
-
-pair<int, int> create_pipe() {
-    int pd[2];
-    if (pipe(pd) != 0) throw std::ios_base::failure("Pipe failed");
-    return {pd[0], pd[1]};
 }
 
 string read_fixed_string(int fd, size_t size) {
@@ -64,9 +59,9 @@ class Evaluator {
 private:
     EvaluatorData config;
     
-    int names_read_fd;
-    int event_write_fd;
-    pid_t reader_pid;
+    int names_read_fd = -1;
+    int event_write_fd = -1;
+    pid_t reader_pid = -1;
 
     size_t active_calls = 0;
     size_t active_policy_calls = 0;
@@ -86,6 +81,46 @@ private:
 
     map<EventType, function<void(Event)>> commands;
 
+    void try_to_close(int& fd) {
+        if (fd > 0) ASSERT_SYS_OK(close(fd));
+        fd = -1;
+    }
+
+    void try_to_waitpid(int& pid) {
+        if (pid > 0) ASSERT_SYS_OK(waitpid(pid, NULL, 0));
+        pid = -1;
+    }
+
+    void try_to_pipe(int (&pd)[2]) {
+        if (pipe(pd) == -1) {
+            terminate_evaluator();
+            throw std::ios_base::failure("pipe2_failed");
+        }
+    }
+
+    void try_to_pipe2(int (&pd)[2]) {
+        if (pipe2(pd, O_CLOEXEC) == -1) {
+            terminate_evaluator();
+            throw std::ios_base::failure("pipe2_failed");
+        }
+    }
+
+    void try_to_dup2(int from, int to) {
+        if (dup2(from, to) == -1) {
+            terminate_evaluator();
+            throw(std::ios_base::failure("dup2_failed"));
+        }
+    }
+
+    pid_t try_to_fork() {
+        pid_t pid = fork();
+
+        if (pid == -1) {
+            terminate_evaluator();
+            throw std::ios_base::failure("Fork failed");
+        }
+    }
+
     void try_print_results() {
         while (tests.count(next_print_id)) {
             auto& t = tests[next_print_id];
@@ -97,7 +132,7 @@ private:
             cout << t.name << " "
                  << t.answer << endl;
             
-            cleanup_test(next_print_id);
+            tests.erase(next_print_id);
             next_print_id++;
         }
     }
@@ -105,28 +140,35 @@ private:
     int spawn_policy_worker() {
         int pin[2], pout[2];
 
-        if (pipe2(pin, O_CLOEXEC) == -1 || pipe2(pout, O_CLOEXEC) == -1) 
-            syserr("pipe2 worker failed");
-
-        pid_t pid = fork();
-        if (pid == -1) syserr("fork worker failed");
-
-        if (pid == 0) {
-            dup2(pin[0], STDIN_FILENO);
-            dup2(pout[1], STDOUT_FILENO);
-            
-            close(pin[0]); close(pin[1]);
-            close(pout[0]); close(pout[1]);
-            close(event_write_fd);
-            
-            execl(config.policy_path.c_str(), config.policy_path.c_str(), NULL);
-            
-            perror("exec policy failed");
-            _exit(1);
+        try_to_pipe2(pin);
+        try {
+            try_to_pipe2(pout);
+        } catch(...) {
+            try_to_close(pin[0]);
+            try_to_close(pin[1]);
+            throw;
         }
 
-        close(pin[0]); 
-        close(pout[1]);
+        pid_t pid = try_to_fork();
+
+        if (pid == 0) {
+            ASSERT_SYS_OK(dup2(pin[0], STDIN_FILENO));
+            ASSERT_SYS_OK(dup2(pout[1], STDOUT_FILENO));
+
+            ASSERT_SYS_OK(close(pin[0]));
+            ASSERT_SYS_OK(close(pin[1]));
+            ASSERT_SYS_OK(close(pout[0])); 
+            ASSERT_SYS_OK(close(pout[1]));
+            ASSERT_SYS_OK(close(event_write_fd));
+            
+            ASSERT_SYS_OK(execl(config.policy_path.c_str(), config.policy_path.c_str(), NULL));
+            
+            perror("exec policy failed");
+            exit(1);
+        }
+
+        try_to_close(pin[0]); 
+        try_to_close(pout[1]);
 
         int id = next_worker_id++;
         PolicyWorker w;
@@ -143,23 +185,33 @@ private:
     }
 
     pid_t spawn_reader(int& out_names_fd, int& out_event_write) {
-        auto [name_reader, name_writer] = create_pipe();
-        auto [event_reader, event_writer] = create_pipe();
+        int f[2], s[2];
+        try_to_pipe(f);
+        try {
+            try_to_pipe(s);
+        } catch(...) {
+            try_to_close(f[0]);
+            try_to_close(f[1]);
+        }
 
-        pid_t pid = fork();
-        if (pid == -1) throw std::ios_base::failure("Fork reader failed");
+        auto [name_reader, name_writer] = f;
+        auto [event_reader, event_writer] = s;
+
+        pid_t pid = try_to_fork();
 
         if (pid == 0) {
-            close(name_reader); close(event_reader);
-            execl("./reader", "./reader", 
+            ASSERT_SYS_OK(close(name_reader));
+            ASSERT_SYS_OK(close(event_reader));
+
+            ASSERT_SYS_OK(execl("./reader", "./reader", 
                   to_string(name_writer).c_str(), 
-                  to_string(event_writer).c_str(), NULL);
+                  to_string(event_writer).c_str(), NULL));
             syserr("exec reader failed");
         }
 
-        close(name_writer); 
-        if (dup2(event_reader, STDIN_FILENO) == -1) syserr("dup2 failed");
-        close(event_reader);
+        try_to_close(name_writer); 
+        try_to_dup2(event_reader, STDIN_FILENO);
+        try_to_close(event_reader);
 
         out_names_fd = name_reader;
         fcntl(out_names_fd, F_SETFD, FD_CLOEXEC);
@@ -169,16 +221,15 @@ private:
     }
 
     pid_t spawn_waiter(int fd_to_watch, int id) {
-        pid_t worker = fork();
-        if (worker == -1) throw std::ios_base::failure("fork waiter failed");
+        pid_t worker = try_to_fork();
 
         if (worker == 0) { 
-            if (dup2(fd_to_watch, STDIN_FILENO) == -1) exit(1);
-            close(fd_to_watch);
+            ASSERT_SYS_OK(dup2(fd_to_watch, STDIN_FILENO));
+            ASSERT_SYS_OK(close(fd_to_watch));
             
-            execl("./worker_waiter", "worker_waiter", 
+            ASSERT_SYS_OK(execl("./worker_waiter", "worker_waiter", 
                   to_string(event_write_fd).c_str(), 
-                  to_string(id).c_str(), NULL);
+                  to_string(id).c_str(), NULL));
             perror("exec waiter failed");
             exit(1);
         }
@@ -186,63 +237,67 @@ private:
     }
 
     pid_t spawn_copier(int src, int dst, int id, char latch, size_t size) {
-        pid_t worker = fork();
-        if (worker == -1) syserr("fork copier failed");
+        pid_t worker = try_to_fork();
         
         if (worker == 0) {
-            dup2(src, STDIN_FILENO);
-            dup2(dst, STDOUT_FILENO);
-            close(src); close(dst);
+            ASSERT_SYS_OK(dup2(src, STDIN_FILENO));
+            ASSERT_SYS_OK(dup2(dst, STDOUT_FILENO));
+            ASSERT_SYS_OK(close(src)); 
+            ASSERT_SYS_OK(close(dst));
 
-            execl("./worker_copier", "worker_copier",
+            ASSERT_SYS_OK(execl("./worker_copier", "worker_copier",
                   to_string(event_write_fd).c_str(),
                   to_string(id).c_str(),
                   to_string((int)latch).c_str(),
-                  to_string(size).c_str(), NULL);
+                  to_string(size).c_str(), NULL));
             perror("exec copier failed");
-            _exit(1);
+            exit(1);
         }
         return worker;
-    }
-
-    bool can_start_policy() {
-        return !wait_policy.empty() &&
-            active_calls < config.max_calls &&
-            active_policy_calls < config.max_policy;
     }
 
     void spawn_environment(int id) {
         auto& test = tests[id];
         
         int p_to_child[2], p_from_child[2];
-        if (pipe(p_to_child) == -1 || pipe(p_from_child) == -1) syserr("pipe env");
+        try_to_pipe2(p_to_child);
+        try {
+            try_to_pipe2(p_from_child);
+        } catch(...) {
+            try_to_close(p_from_child[0]);
+            try_to_close(p_from_child[1]);
+        }
 
-        test.env_pid = fork();
-        if (test.env_pid == -1) syserr("fork env");
+        test.env_pid = try_to_fork();
 
         if (test.env_pid == 0) {
-            dup2(p_to_child[0], STDIN_FILENO);
-            dup2(p_from_child[1], STDOUT_FILENO);
+            ASSERT_SYS_OK(dup2(p_to_child[0], STDIN_FILENO));
+            ASSERT_SYS_OK(dup2(p_from_child[1], STDOUT_FILENO));
 
-            close(p_to_child[0]); close(p_to_child[1]);
-            close(p_from_child[0]); close(p_from_child[1]);
-            close(event_write_fd);
+            ASSERT_SYS_OK(close(p_to_child[0]));
+            ASSERT_SYS_OK(close(p_to_child[1]));
+            ASSERT_SYS_OK(close(p_from_child[0])); 
+            ASSERT_SYS_OK(close(p_from_child[1]));
+            ASSERT_SYS_OK(close(event_write_fd));
 
             execl(config.env_path.c_str(), config.env_path.c_str(), test.name.c_str(), NULL);
             syserr("exec env failed");
         }
 
-        close(p_to_child[0]);
-        close(p_from_child[1]);
+        try_to_close(p_to_child[0]);
+        try_to_close(p_from_child[1]);
 
         test.env_in = p_to_child[1];
         test.env_out = p_from_child[0];
 
-        fcntl(test.env_in, F_SETFD, FD_CLOEXEC);
-        fcntl(test.env_out, F_SETFD, FD_CLOEXEC);
-
         test.current_worker_pid = spawn_waiter(test.env_out, id);
         test.state = TestState::WAITING_FOR_ENV_OUTPUT;
+    }
+
+    bool can_start_policy() {
+        return !wait_policy.empty() &&
+            active_calls < config.max_calls &&
+            active_policy_calls < config.max_policy;
     }
 
     void schedule() {
@@ -309,10 +364,7 @@ private:
         auto& t = tests[e.test_id];
         t.latch_byte = e.data_byte;
         
-        if (t.current_worker_pid > 0) {
-            waitpid(t.current_worker_pid, NULL, 0);
-            t.current_worker_pid = -1;
-        }
+        try_to_waitpid(t.current_worker_pid);
 
         if (active_calls > 0) active_calls--;
 
@@ -320,14 +372,15 @@ private:
             if (e.data_byte == 'T') {
                 t.answer = read_fixed_string(t.env_out, STATE_SIZE - 1);
                 t.is_calculated = true;
+                cleanup_test(t.test_id);
                 try_print_results();
             } else {
-                t.state = TestState::QUEUED_FOR_GPU;
+                t.state = TestState::QUEUED_FOR_ENV;
                 wait_policy.push(e.test_id);
             }
         } 
         else if (t.state == TestState::WAITING_FOR_POLICY_OUTPUT) {
-            t.state = TestState::QUEUED_FOR_CPU;
+            t.state = TestState::QUEUED_FOR_ENV;
             if (active_policy_calls > 0) active_policy_calls--;
             wait_env.push(e.test_id);
         }
@@ -337,17 +390,17 @@ private:
         auto& t = tests[e.test_id];
         
         if (t.current_worker_pid > 0) {
-            waitpid(t.current_worker_pid, NULL, 0);
+            try_to_waitpid(t.current_worker_pid);
             t.current_worker_pid = -1;
         }
 
-        if (t.state == TestState::QUEUED_FOR_GPU) {
+        if (t.state == TestState::QUEUED_FOR_ENV) {
             t.state = TestState::WAITING_FOR_POLICY_OUTPUT;
             
             auto& worker = policy_pool[t.assigned_worker_idx];
             t.current_worker_pid = spawn_waiter(worker.pipe_out, e.test_id);
         } 
-        else if (t.state == TestState::QUEUED_FOR_CPU) {
+        else if (t.state == TestState::QUEUED_FOR_ENV) {
             int wid = t.assigned_worker_idx;
             if (wid != -1) {
                 policy_pool[wid].is_busy = false;
@@ -363,46 +416,60 @@ private:
     void cleanup_test(int id) {
         auto& t = tests[id];
         
-        if (t.env_pid > 0) waitpid(t.env_pid, NULL, 0);
+        if (t.env_pid > 0) try_to_waitpid(t.env_pid);
         
-        if (t.env_in != -1) close(t.env_in);
-        if (t.env_out != -1) close(t.env_out);
-
-        tests.erase(id);
+        if (t.env_in != -1) try_to_close(t.env_in);
+        if (t.env_out != -1) try_to_close(t.env_out);
         
         if (active_env > 0) active_env--;
     }
 
-    // add proper waiting for the end of file
+    void soft_shutdown() {
+        shut_soft = true;
+        kill(reader_pid, SIGINT);
+        try_to_waitpid(reader_pid);
+        reader_pid = -1;
+    }
 
-    void perform_shutdown() {
+    void clean_all() {
+        for (auto& [id, t] : tests) {
+            try_to_close(t.env_in);
+            try_to_close(t.env_out);
+        }
+        
+        for (auto& [wid, worker] : policy_pool) {
+            try_to_close(worker.pipe_in);
+            try_to_close(worker.pipe_out);
+        }
+
+        try_to_close(names_read_fd);
+        try_to_close(event_write_fd);
+
+        try_to_waitpid(reader_pid);
+
+        for (auto& [id, t] : tests) {
+            try_to_waitpid(t.env_pid);
+            try_to_waitpid(t.current_worker_pid);
+        }
+        
+        for (auto& [wid, worker] : policy_pool) {
+            try_to_waitpid(worker.pid);
+        }
+    }
+
+    void terminate_evaluator() {
         for (auto& [id, t] : tests) {
             if (t.env_pid > 0) kill(t.env_pid, SIGINT);
             if (t.current_worker_pid > 0) kill(t.current_worker_pid, SIGINT);
-            
-            if (t.env_in != -1) close(t.env_in);
-            if (t.env_out != -1) close(t.env_out);
         }
         
         for (auto& [wid, worker] : policy_pool) {
             kill(worker.pid, SIGINT);
-            close(worker.pipe_in);
-            close(worker.pipe_out);
         }
 
-        close(names_read_fd);
-        close(event_write_fd);
         kill(reader_pid, SIGINT);
-        waitpid(reader_pid, NULL, 0);
 
-        for (auto& [id, t] : tests) {
-            if (t.env_pid > 0) waitpid(t.env_pid, NULL, 0);
-            if (t.current_worker_pid > 0) waitpid(t.current_worker_pid, NULL, 0);
-        }
-        
-        for (auto& [wid, worker] : policy_pool) {
-            waitpid(worker.pid, NULL, 0);
-        }
+        clean_all();
     }
 
 public:
@@ -411,9 +478,11 @@ public:
             { EventType::NEW_TEST, [this](Event e) { this->handle_new_test(e); }},
             { EventType::EVT_DATA_READY, [this](Event e) { this->handle_data_ready(e); }},
             { EventType::EVT_TRANSFER_DONE, [this](Event e) { this->handle_transfer_done(e); }},
-            { EventType::STDIN_CLOSED, [](Event e) { stop_requested = true; }},
-            { EventType::EVT_ERROR, [](Event e) {
+            { EventType::STDIN_CLOSED, [this](Event e) { this->soft_shutdown(); }},
+            { EventType::EVT_ERROR, [this](Event e) {
                 std::cerr << "Error reported in test " << e.test_id << std::endl;
+                this->terminate_evaluator();
+                throw std::ios_base::failure("Failure reported");
             }}
         };
     }
@@ -422,15 +491,19 @@ public:
         reader_pid = spawn_reader(names_read_fd, event_write_fd);
         
         Event e;
-        while (true) {
-            if (stop_requested) { perform_shutdown(); break; }
+        while (!shut_soft || active_env > 0) {
+            if (stop_requested) { terminate_evaluator(); break; }
 
             ssize_t n = read(STDIN_FILENO, &e, sizeof(e));
-
-            if (stop_requested || (n < 0 && errno == EINTR)) {
-                perform_shutdown(); break;
+            
+            if (stop_requested || (n < 0)) {
+                terminate_evaluator(); break;
             }
             if (n <= 0) break; // EOF
+
+            if (e.type == EventType::NEW_TEST && shut_soft) {
+                continue;
+            }
 
             if (commands.count(e.type)) {
                 commands.at(e.type)(e);
@@ -455,6 +528,8 @@ int main(int argc, char* argv[]) {
         EvaluatorData config(parser.get_args());
         Evaluator app(config);
         app.run();
+        if (stop_requested)
+            return 2;
     } catch (...) {
         cerr << "Unknown Error" << endl;
         return 1;

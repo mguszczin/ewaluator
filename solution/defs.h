@@ -77,9 +77,9 @@ namespace event_data {
     enum class TestState {
         CREATED,
         WAITING_FOR_ENV_OUTPUT,    // Env is calculating, Waiter is listening on Env Output
-        QUEUED_FOR_GPU,            // Env finished, waiting for Policy slot (GPU)
+        QUEUED_FOR_POLICY,            // Env finished, waiting for Policy slot (GPU)
         WAITING_FOR_POLICY_OUTPUT, // Policy is calculating, Waiter is listening on Policy Output
-        QUEUED_FOR_CPU,            // Policy finished, waiting for Env slot (CPU)
+        QUEUED_FOR_ENV,            // Policy finished, waiting for Env slot (CPU)
         SAVING,                    // Saver is writing final result to disk
         FINISHED
     };
@@ -110,4 +110,4 @@ namespace event_data {
     };
 }
 
-#endif // DEFS_H
+#endif
