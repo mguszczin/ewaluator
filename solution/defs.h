@@ -33,7 +33,7 @@ namespace utils {
     public:
         ParseReader(int argc, char** args) {
             // Start loop from 1 to skip the executable name (argv[0])
-            for (int i = 1; i < argc; i++) {
+            for (int i = 0; i < argc; i++) {
                 arguments.push_back(std::string{args[i]});
             }
         }
@@ -53,7 +53,6 @@ namespace event_data {
         NEW_TEST          = 0, // Reader has sent a new test name
         STDIN_CLOSED      = 1, // Reader has finished (EOF)
         EVT_DATA_READY    = 2, // A Waiter detected the first byte of data
-        EVT_TRANSFER_DONE = 3, // A Copier finished moving data between pipes
         EVT_TEST_FINISHED = 4, // A Saver finished writing result to file
         EVT_ERROR         = 5  // Something went wrong
     };
@@ -69,45 +68,11 @@ namespace event_data {
     // The message packet sent through the pipe
     struct Event {
         EventType type;
-        size_t test_id;
+        int test_id;
         char data_byte; // The "latch byte" - the first byte read by a Waiter
     };
 
-    // Lifecycle states for a single Test
-    enum class TestState {
-        CREATED,
-        WAITING_FOR_ENV_OUTPUT,    // Env is calculating, Waiter is listening on Env Output
-        QUEUED_FOR_POLICY,            // Env finished, waiting for Policy slot (GPU)
-        WAITING_FOR_POLICY_OUTPUT, // Policy is calculating, Waiter is listening on Policy Output
-        QUEUED_FOR_ENV,            // Policy finished, waiting for Env slot (CPU)
-        SAVING,                    // Saver is writing final result to disk
-        FINISHED
-    };
-
     // The main database record for a Test
-    struct Test {
-        size_t test_id;
-        std::string name;
-        
-        // Process IDs (Needed for SIGINT cleanup)
-        pid_t env_pid = -1;
-        pid_t current_worker_pid = -1;
-        int assigned_worker_idx = -1;
-
-        // Pipe File Descriptors (Parent's end)
-        int env_in = -1;  // We write Actions here
-        int env_out = -1; // We read States from here
-        int pol_in = -1;  // We write States here
-        int pol_out = -1; // We read Actions from here
-
-        // Logic State
-        TestState state = TestState::CREATED;
-        
-        // Temporary storage for the byte caught by the Waiter
-        char latch_byte = 0; 
-        std::string answer;
-        bool is_calculated = false;
-    };
 }
 
 #endif
