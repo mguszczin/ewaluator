@@ -31,6 +31,83 @@ using namespace event_data;
 atomic<bool> stop_requested(false);
 atomic<bool> shut_soft(false);
 
+namespace forked_processes {
+
+    void go_to_reader(int event_pipe_fd) {
+        signal(SIGINT, SIG_DFL);
+        if (event_pipe_fd < 0) {
+            cerr << "Error: File descriptor cannot be negative." << endl;
+            exit(1);
+        }
+
+        string command;
+
+        while (cin >> command) {
+            
+            vector<char> buffer(NAME_SIZE, 0);
+            
+            size_t len = command.length();
+            if (len > NAME_SIZE) len = NAME_SIZE; 
+
+            command.copy(buffer.data(), len);
+
+            if (!utils::write_all(STDOUT_FILENO, buffer.data(), NAME_SIZE)) {
+                break;
+            }
+
+            Event e = {}; 
+            e.type = EventType::NEW_TEST;
+            e.test_id = -1;
+            e.data_byte = 0;
+            
+            if (!utils::write_all(event_pipe_fd, &e, sizeof(e))) {
+                break;
+            }
+        }
+
+        Event e = {};
+        e.type = EventType::STDIN_CLOSED;
+        e.test_id = -1;
+        e.data_byte = 0;
+
+        utils::write_all(event_pipe_fd, &e, sizeof(e));
+
+        close(event_pipe_fd);
+        
+        exit(0);
+    }
+
+    void go_to_worker(size_t test_id) {
+        signal(SIGINT, SIG_DFL);
+        char c = 0;
+        ssize_t r;
+
+        do {
+            r = read(STDIN_FILENO, &c, 1);
+        } while (r == -1 && errno == EINTR);
+
+        Event e = {}; 
+        e.test_id = test_id;
+
+        if (r > 0) {
+            e.type = EventType::EVT_DATA_READY;
+            e.data_byte = c;
+        } else {
+            cerr << "error in waiter" << endl;
+            e.type = EventType::EVT_ERROR;
+            e.data_byte = 0;
+            
+            if (r == -1) {
+                cerr << "Warning: Read failed: " << strerror(errno) << endl;
+            }
+        }
+        if (!utils::write_all(STDOUT_FILENO, &e, sizeof(e))) {
+            cerr << "Error: Failed to write event to stdout: " << strerror(errno) << endl;
+            exit(1);
+        }
+    }
+}
+
 /**
  * Overrided function for sending signal to evaluator.
  * 
@@ -244,8 +321,6 @@ private:
         ((f(args)), ...);
     }
 
-
-
     const function<void(int)> assert_and_close =
         [this](int fd) { ASSERT_SYS_OK(close(fd)); };
 
@@ -316,9 +391,7 @@ private:
             assert_and_close_l({name_reader, event_reader});
             dup_and_close(name_writer, STDOUT_FILENO);
 
-            ASSERT_SYS_OK(execl(reader_path.c_str(),
-                                reader_path.c_str(), 
-                                to_string(event_writer).c_str(), nullptr));
+            forked_processes::go_to_reader(event_writer);
             syserr("exec reader failed");
         }
 
@@ -397,12 +470,7 @@ private:
             dup_and_close(fd_to_watch, STDIN_FILENO);
             dup_and_close(event_write_fd, STDOUT_FILENO);
             
-            ASSERT_SYS_OK(execl(
-                          waiter_path.c_str(),
-                          waiter_path.c_str(), 
-                          to_string(id).c_str(),
-                          nullptr));
-            perror("exec waiter failed");
+            forked_processes::go_to_worker(id);
             exit(1);
         }
         return worker;
@@ -530,7 +598,7 @@ private:
         }
     }
 
-    void handle_new_test(Event e) {
+    void handle_new_test([[maybe_unused]] Event e) {
         size_t id = next_test_id;
         next_test_id++;
         tests[id] = Test{
@@ -619,7 +687,7 @@ public:
         commands = {
             { EventType::NEW_TEST, [this](Event e) { this->handle_new_test(e); }},
             { EventType::EVT_DATA_READY, [this](Event e) { this->handle_data_ready(e); }},
-            { EventType::STDIN_CLOSED, [this](Event e) { this->soft_shutdown(); }},
+            { EventType::STDIN_CLOSED, [this]([[maybe_unused]]Event e) { this->soft_shutdown(); }},
             { EventType::EVT_ERROR, [this](Event e) {
                 std::cerr << "Error reported in test " << e.test_id << std::endl;
                 this->terminate_evaluator();
