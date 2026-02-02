@@ -77,36 +77,49 @@ namespace forked_processes {
         exit(0);
     }
 
-    void go_to_worker(size_t test_id) {
+    void handle_wakeup(int) { }
+
+    void go_to_persistent_waiter(int id, bool test) {
+        sigset_t mask, oldmask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &mask, &oldmask);
+
+        // Setup handler
+        struct sigaction sa = {};
+        sa.sa_handler = handle_wakeup;
+        sigaction(SIGUSR1, &sa, nullptr);
+
         signal(SIGINT, SIG_DFL);
+        
         char c = 0;
         ssize_t r;
 
-        do {
-            r = read(STDIN_FILENO, &c, 1);
-        } while (r == -1 && errno == EINTR);
+        while (true) {
+            do {
+                r = read(STDIN_FILENO, &c, 1);
+            } while (r == -1 && errno == EINTR);
 
-        Event e = {}; 
-        e.test_id = test_id;
+            if (r <= 0) {
+                break; 
+            }
 
-        if (r > 0) {
+            Event e = {}; 
+            if (test) e.test_id = id, e.policy_id = -1;
+            else e.policy_id = id, e.test_id = -1;
             e.type = EventType::EVT_DATA_READY;
             e.data_byte = c;
-        } else {
-            cerr << "error in waiter" << endl;
-            e.type = EventType::EVT_ERROR;
-            e.data_byte = 0;
-            
-            if (r == -1) {
-                cerr << "Warning: Read failed: " << strerror(errno) << endl;
+
+            if (!utils::write_all(STDOUT_FILENO, &e, sizeof(e))) {
+                break;
             }
+            sigsuspend(&oldmask);
         }
-        if (!utils::write_all(STDOUT_FILENO, &e, sizeof(e))) {
-            cerr << "Error: Failed to write event to stdout: " << strerror(errno) << endl;
-            exit(1);
-        }
+        
+        exit(0);
     }
 }
+
 
 /**
  * Overrided function for sending signal to evaluator.
@@ -159,7 +172,7 @@ enum class TestState {
  * -  `state` current state of our Test structure.
  */
 struct Test {
-    size_t test_id;
+    ssize_t test_id;
     string name;
     string answer="";
     
@@ -221,8 +234,8 @@ private:
     queue<int> wait_policy; // Waiting for transfer Env -> Policy
 
     map<int, Test> tests;
-    size_t next_test_id = 0;
-    size_t next_print_id = 0;
+    ssize_t next_test_id = 0;
+    ssize_t next_print_id = 0;
 
     map<int, PolicyWorker> policy_pool;
     queue<int> free_workers;
@@ -423,7 +436,22 @@ private:
             errno = EINVAL;
             ASSERT_SYS_OK(-1);
         }
-}
+    }
+
+    pid_t spawn_waiter(int fd_to_watch, int id, bool is_test) {
+        pid_t worker = safe_fork();
+
+        static string waiter_path = config.binary_path + "/waiter";
+
+        if (worker == 0) { 
+            dup_and_close(fd_to_watch, STDIN_FILENO);
+            dup_and_close(event_write_fd, STDOUT_FILENO);
+            
+            forked_processes::go_to_persistent_waiter(id, is_test);
+            exit(1);
+        }
+        return worker;
+    }
 
     void spawn_policy_worker() {
         static string reader_path = config.binary_path + "/reader";
@@ -450,30 +478,18 @@ private:
 
         safe_close(pin[0]); 
         safe_close(pout[1]);
+        cerr << "waiter spawned" << endl;
+        pid_t waiter_pid = spawn_waiter(pout[0], id, false);
 
         PolicyWorker w{
                 .id = id,
                 .pid = pid,
                 .pipe_in = pin[1],
                 .pipe_out = pout[0],
-                .is_busy = false };
+                .is_busy = false,
+                .waiter_pid = waiter_pid };
         policy_pool[id] = w;
         free_workers.push(id);
-    }
-
-    pid_t spawn_waiter(int fd_to_watch, int id) {
-        pid_t worker = safe_fork();
-
-        static string waiter_path = config.binary_path + "/waiter";
-
-        if (worker == 0) { 
-            dup_and_close(fd_to_watch, STDIN_FILENO);
-            dup_and_close(event_write_fd, STDOUT_FILENO);
-            
-            forked_processes::go_to_worker(id);
-            exit(1);
-        }
-        return worker;
     }
 
     void spawn_environment(int id) {
@@ -501,7 +517,7 @@ private:
         safe_close(p_to_child[0]);
         safe_close(p_from_child[1]);
         test.state = TestState::WAITING_FOR_ENV_OUTPUT;
-        test.current_waiter_pid = spawn_waiter(test.env_out, id);
+        test.current_waiter_pid = spawn_waiter(test.env_out, id, true);
     }
 
     bool can_calc_action() {
@@ -532,7 +548,6 @@ private:
 
             write_fixed_string(t.env_in, t.current_action_tmp);
             t.current_action_tmp.clear();
-            t.current_waiter_pid = spawn_waiter(t.env_out, t.test_id);
         }
 
         while (can_calc_action()) {
@@ -546,13 +561,13 @@ private:
 
             worker.is_busy = true;
             t.assigned_worker_idx = worker_id;
+            worker.current_test_id = t.test_id;
 
             active_calls++;
             active_policy_calls++;
             t.state = TestState::WAITING_FOR_POLICY_OUTPUT;
             write_fixed_string(worker.pipe_in, t.current_state_tmp);
             t.current_state_tmp.clear();
-            t.current_waiter_pid = spawn_waiter(worker.pipe_out, t.test_id);
         }
 
         while (can_create_new_env()) {
@@ -564,23 +579,31 @@ private:
     }
 
     void handle_data_ready(Event e) {
-        auto& t = tests[e.test_id];
+        ssize_t id;
+        if (e.test_id == -1) {
+            PolicyWorker& p = policy_pool[e.policy_id];
+            id = p.current_test_id;
+            p.current_test_id = -1;
+        }else id = e.test_id;
+        auto& t = tests[id];
         t.latch_byte_tmp = e.data_byte;
-        
-        safe_waitpid(t.current_waiter_pid);
+
+        cerr << "HELLO GOT SOME INPUT"  << " " << t.test_id<< endl;
 
         if (active_calls > 0) active_calls--;
         if (t.state == TestState::WAITING_FOR_ENV_OUTPUT) {
+            cerr << "START READING" << endl;
             string tmp = string{e.data_byte} 
                 + read_fixed_string(t.env_out, STATE_SIZE);
-
+            kill(t.current_waiter_pid, SIGUSR1);
+            cerr << "END READING" << endl;
             if (e.data_byte == 'T') {
                 t.answer = move(tmp);
                 cleanup_test(t.test_id);
                 try_print_results();
             } else {
                 t.state = TestState::QUEUED_FOR_POLICY;
-                wait_policy.push(e.test_id);
+                wait_policy.push(t.test_id);
                 t.current_state_tmp = move(tmp);
             }
             
@@ -588,10 +611,11 @@ private:
             auto& worker = policy_pool[t.assigned_worker_idx];
             string tmp = string{e.data_byte}
                 + read_fixed_string(worker.pipe_out, ACTION_SIZE);
-            
+
+            kill(worker.waiter_pid, SIGUSR1);
             free_policy(t.assigned_worker_idx);
             t.state = TestState::QUEUED_FOR_ENV;
-            wait_env.push(e.test_id);
+            wait_env.push(t.test_id);
             t.current_action_tmp = move(tmp);
         } else {
             syserr("undefined behaviour in data_ready");
@@ -599,7 +623,7 @@ private:
     }
 
     void handle_new_test([[maybe_unused]] Event e) {
-        size_t id = next_test_id;
+        ssize_t id = next_test_id;
         next_test_id++;
         tests[id] = Test{
             .test_id = id,
@@ -624,6 +648,8 @@ private:
         
         // we don't need to kill because the enviroment
         // should shut itself
+        safe_kill(t.current_waiter_pid);
+        safe_waitpid(t.current_waiter_pid);
         safe_waitpid(t.env_pid);
         safe_close(t.env_in);
         safe_close(t.env_out);
@@ -652,10 +678,12 @@ private:
     void clean_all() {
         for (auto& [wid, worker] : policy_pool) {
             safe_kill(worker.pid);
+            safe_kill(worker.waiter_pid);
         }
         safe_waitpid(reader_pid);
         for (auto& [wid, worker] : policy_pool) {
             safe_waitpid(worker.pid);
+            safe_waitpid(worker.waiter_pid);
             assert_and_close_ter(worker.pipe_in);
             assert_and_close_ter(worker.pipe_out);
         }
@@ -701,8 +729,6 @@ public:
         
         Event e;
        while (!shut_soft || active_env > 0) {
-            cerr << "HELLO HOW ARE YOU" << endl;
-            cerr << STATE_SIZE << " " << endl;
             if (stop_requested) { 
                 terminate_evaluator(); 
                 return; 

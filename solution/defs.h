@@ -82,17 +82,20 @@ namespace event_data {
     };
 
     struct PolicyWorker {
-        int id;             // Indeks w wektorze
+        ssize_t id;             // Indeks w wektorze
         pid_t pid;          // PID procesu
         int pipe_in;        // Do pisania (Input Polityki)
         int pipe_out;       // Do czytania (Output Polityki)
         bool is_busy;       // Czy aktualnie mieli jakiś test?
+        ssize_t current_test_id = -1;
+        pid_t waiter_pid;
     };
 
     // The message packet sent through the pipe
     struct Event {
         EventType type;
-        int test_id;
+        ssize_t test_id = -1;
+        ssize_t policy_id = -1;
         char data_byte; // The "latch byte" - the first byte read by a Waiter
     };
 
