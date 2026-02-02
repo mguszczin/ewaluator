@@ -4,6 +4,9 @@
 #include <vector>
 #include <string>
 #include <unistd.h>
+#include <iostream>
+#include <stdio.h>
+#include <cstring>
 
 // --- CONSTANTS ---
 
@@ -42,6 +45,27 @@ namespace utils {
             return arguments;
         }
     };
+
+    bool write_all(int fd, const void* buffer, size_t count) {
+    const char* ptr = static_cast<const char*>(buffer);
+    size_t remaining = count;
+
+    while (remaining > 0) {
+        ssize_t written = write(fd, ptr, remaining);
+        
+        if (written == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::cerr << "Write error: " << strerror(errno) << std::endl;
+            return false;
+        }
+        
+        ptr += written;
+        remaining -= written;
+    }
+    return true;
+}
 }
 
 // --- EVENT & DATA STRUCTURES ---
